@@ -21,7 +21,8 @@ pub mod index_table;
 /// Rate limiting for handshake initiation packets.
 pub mod rate_limiter;
 
-mod session;
+/// An established transport session (the kernel's `noise_keypair`).
+pub mod session;
 mod timers;
 
 use rand::{RngCore, SeedableRng, rngs::StdRng};
@@ -43,8 +44,45 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const MAX_QUEUE_DEPTH: usize = 256;
-/// number of sessions in the ring, better keep a PoT.
-const N_SESSIONS: usize = 8;
+
+/// The sessions a peer may hold at once.
+///
+/// The protocol needs exactly three, and naming them is what makes the
+/// initiator/responder asymmetry explicit instead of implied by storage order.
+/// This mirrors the kernel's `struct noise_keypairs`.
+#[derive(Default)]
+struct Sessions {
+    /// Superseded by `current`, but still accepted for receiving while packets
+    /// sent before the rekey drain.
+    previous: Option<Arc<session::Session>>,
+    /// The session used for sending.
+    current: Option<Arc<session::Session>>,
+    /// Established as responder and not yet confirmed. It may not be used for
+    /// sending until an authenticated packet arrives on it, because our handshake
+    /// response may never have reached the peer.
+    next: Option<Arc<session::Session>>,
+}
+
+impl Sessions {
+    /// Every session currently held, `current` first.
+    ///
+    /// That order is the order [`Tunn::estimate_loss`] weights them in, so the
+    /// session actually carrying traffic dominates.
+    fn iter(&self) -> impl Iterator<Item = &Arc<session::Session>> {
+        [&self.current, &self.previous, &self.next]
+            .into_iter()
+            .flatten()
+    }
+
+    /// Every role, occupied or not, so a caller can vacate one.
+    fn slots_mut(&mut self) -> [&mut Option<Arc<session::Session>>; 3] {
+        [&mut self.previous, &mut self.current, &mut self.next]
+    }
+
+    fn clear(&mut self) {
+        *self = Self::default();
+    }
+}
 
 /// Result of processing a WireGuard packet through the [`Tunn`].
 #[derive(Debug)]
@@ -69,13 +107,12 @@ impl From<WireGuardError> for TunnResult {
 pub struct Tunn<R: RngCore + Send = StdRng> {
     /// The handshake currently in progress.
     handshake: handshake::Handshake,
-    /// The [`N_SESSIONS`] most recent sessions.
-    sessions: [Option<session::Session>; N_SESSIONS],
-    /// Index of the most recently used session.
-    current: usize,
-    /// Counter for slot selection when inserting new sessions.
-    /// Used to find the next index in `sessions` with `session_counter % N_SESSIONS`.
-    session_counter: usize,
+    /// The sessions this tunnel holds.
+    ///
+    /// Sessions are shared rather than owned outright so that a decryption in
+    /// flight keeps its session alive even after the tunnel has moved on, the
+    /// way the kernel's refcount on `struct noise_keypair` does.
+    sessions: Sessions,
     /// Queue to store blocked packets.
     packet_queue: VecDeque<Packet>,
 
@@ -132,8 +169,6 @@ impl<R: RngCore + Send> Tunn<R> {
                 preshared_key,
             ),
             sessions: Default::default(),
-            current: Default::default(),
-            session_counter: Default::default(),
             tx_bytes: Default::default(),
             rx_bytes: Default::default(),
 
@@ -143,6 +178,15 @@ impl<R: RngCore + Send> Tunn<R> {
             rate_limiter,
             jitter_rng,
         }
+    }
+
+    /// Attribute this tunnel's session indices to the peer that owns it.
+    ///
+    /// The index table hands this back on every lookup, so resolving an incoming
+    /// packet's index yields both the session and the peer it belongs to. Call it
+    /// once, immediately after constructing the peer; no index exists before then.
+    pub fn set_index_owner(&mut self, owner: index_table::Owner) {
+        self.handshake.set_index_owner(owner);
     }
 
     /// Check if the tunnel handshake has expired.
@@ -170,9 +214,7 @@ impl<R: RngCore + Send> Tunn<R> {
         self.rate_limiter = rate_limiter;
         self.handshake
             .set_static_private(static_private, static_public);
-        for s in &mut self.sessions {
-            *s = None;
-        }
+        self.sessions.clear();
     }
 
     /// Update the preshared key used for future handshakes.
@@ -224,8 +266,7 @@ impl<R: RngCore + Send> Tunn<R> {
     /// Returns `Err(original_packet)` if there is no active session, or if the active session's
     /// sending counter has reached `REJECT_AFTER_MESSAGES`.
     pub fn encapsulate_with_session(&mut self, packet: Packet) -> Result<Packet<WgData>, Packet> {
-        let current = self.current;
-        if let Some(ref session) = self.sessions[current % N_SESSIONS] {
+        if let Some(session) = self.sessions.current.clone() {
             // Send the packet using an established session
             let packet = session.format_packet_data(packet)?;
             self.timer_tick(TimerName::TimeLastPacketSent);
@@ -263,13 +304,13 @@ impl<R: RngCore + Send> Tunn<R> {
         let (packet, session) = self.handshake.receive_handshake_initialization(p)?;
         self.rx_bytes += n_bytes;
 
-        // Store new session in next slot
-        let slot = self.next_session_slot();
-        self.put_session(slot, session);
+        // We are the responder, so the session is only a candidate until the peer
+        // proves it received our response by sending data on it.
+        self.add_session(session, false);
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
         self.timer_tick(TimerName::TimeLastPacketSent);
-        self.timer_tick_session_established(false, slot); // New session established, we are not the initiator
+        self.timer_tick_session_established(false);
 
         self.tx_bytes += packet.as_bytes().len();
 
@@ -295,13 +336,12 @@ impl<R: RngCore + Send> Tunn<R> {
         let keepalive_packet = session
             .format_packet_data(p)
             .expect("a freshly established session's counter cannot be exhausted");
-        // Store new session in next slot
-        let slot = self.next_session_slot();
-        self.put_session(slot, session);
+        // We initiated, and the response proves the peer has the session, so it is
+        // usable for sending immediately.
+        self.add_session(session, true);
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
-        self.timer_tick_session_established(true, slot); // New session established, we are the initiator
-        self.set_current_session(slot);
+        self.timer_tick_session_established(true);
 
         tracing::debug!("Sending keepalive");
         self.tx_bytes += keepalive_packet.as_bytes().len();
@@ -318,45 +358,61 @@ impl<R: RngCore + Send> Tunn<R> {
         Ok(TunnResult::Done)
     }
 
-    /// Update the slot index of the currently used session, if needed.
-    fn set_current_session(&mut self, new_slot: usize) {
-        let cur_slot = self.current;
-        if cur_slot == new_slot {
-            // There is nothing to do, already using this session, this is the common case
-            return;
-        }
-        if self.sessions[cur_slot % N_SESSIONS].is_none()
-            || self.timers.session_timers[new_slot % N_SESSIONS]
-                >= self.timers.session_timers[cur_slot % N_SESSIONS]
-        {
-            self.current = new_slot;
-            tracing::trace!("New session slot: {new_slot}");
-        }
-    }
-
-    /// Get the next round-robin session slot index.
-    fn next_session_slot(&mut self) -> usize {
-        let slot = self.session_counter % N_SESSIONS;
-        self.session_counter = self.session_counter.wrapping_add(1);
-        slot
-    }
-
-    /// Place a session into the given slot.
+    /// Install a freshly negotiated session.
     ///
-    /// If the slot was occupied, the old session (and its [`Index`](index_table::Index)) is dropped,
-    /// which automatically frees the index from the shared table.
-    fn put_session(&mut self, slot: usize, session: session::Session) {
-        self.sessions[slot % N_SESSIONS] = Some(session);
+    /// Which role it takes depends on who initiated, and that is the whole of the
+    /// asymmetry: an initiator has already seen the peer's handshake response, so
+    /// the session is proven and usable for sending at once. A responder has only
+    /// sent one, which may never arrive, so its session waits as `next` until an
+    /// authenticated packet confirms it.
+    ///
+    /// Sessions displaced from a role are dropped here, and dropping one frees its
+    /// index from the shared table.
+    fn add_session(&mut self, mut session: session::Session, i_am_the_initiator: bool) {
+        session.set_birthdate(self.timers[TimerName::TimeCurrent]);
+        let session = Arc::new(session);
+        // Point the index the handshake reserved at the session it produced, so a
+        // data packet naming it resolves in one lookup.
+        session.receiving_index.register_session(&session);
+
+        if i_am_the_initiator {
+            // A `next` we were still waiting on is now moot, but keep it receivable.
+            self.sessions.previous = match self.sessions.next.take() {
+                Some(next) => Some(next),
+                None => self.sessions.current.take(),
+            };
+            self.sessions.current = Some(session);
+        } else {
+            self.sessions.next = Some(session);
+            self.sessions.previous = None;
+        }
+    }
+
+    /// Promote the session a packet just authenticated on, if it was `next`.
+    ///
+    /// Returns whether this confirmed a pending session. The common case is a
+    /// packet on the session already in use, which decides nothing and costs one
+    /// pointer comparison — the kernel's `wg_noise_received_with_keypair`.
+    fn received_with_session(&mut self, session: &Arc<session::Session>) -> bool {
+        let is_next = self
+            .sessions
+            .next
+            .as_ref()
+            .is_some_and(|next| Arc::ptr_eq(next, session));
+        if !is_next {
+            return false;
+        }
+
+        self.sessions.previous = self.sessions.current.take();
+        self.sessions.current = self.sessions.next.take();
+        tracing::trace!("Session confirmed: {}", session.receiving_index);
+        true
     }
 
     /// Decrypt a data packet, and return a [`TunnResult::WriteToTunnel`] (`Ipv4` or `Ipv6`) if
     /// successful.
     fn handle_data(&mut self, packet: Packet<WgData>) -> Result<TunnResult, WireGuardError> {
         let decapsulated_packet = self.decapsulate_with_session(packet)?;
-
-        if !decapsulated_packet.is_empty() {
-            self.timer_tick(TimerName::TimeLastDataPacketReceived);
-        }
 
         Ok(TunnResult::WriteToTunnel(decapsulated_packet))
     }
@@ -372,27 +428,44 @@ impl<R: RngCore + Send> Tunn<R> {
     ) -> Result<Packet, WireGuardError> {
         let r_idx = packet.header.receiver_idx.get();
 
-        // Search for the matching session. Almost always self.current, but older
-        // sessions may still receive packets during a key transition.
-        let (slot, session) = self
+        // Only three sessions can match, and which one is a matter of identity
+        // rather than recency, so there is nothing to rank.
+        let session = self
             .sessions
             .iter()
-            .enumerate()
-            .filter_map(|(i, s)| s.as_ref().map(|s| (i, s)))
-            .find(|(_, s)| s.receiving_index.value() == r_idx)
+            .find(|session| session.receiving_index.value() == r_idx)
+            .cloned()
             .ok_or_else(|| {
                 tracing::trace!("No session available: {r_idx}");
                 WireGuardError::NoCurrentSession
             })?;
 
         let decapsulated_packet = session.receive_packet_data(packet)?;
-
-        self.set_current_session(slot);
-
-        self.timer_tick(TimerName::TimeLastPacketReceived);
-        self.rx_bytes += decapsulated_packet.as_bytes().len();
+        self.accept_decrypted_packet(&session, &decapsulated_packet);
 
         Ok(decapsulated_packet)
+    }
+
+    /// Record a data packet that has already been decrypted with `session`.
+    ///
+    /// Decryption itself needs nothing from the tunnel — a [`Session`](session::Session)
+    /// is self-contained and internally synchronised — so a caller holding an
+    /// `Arc<Session>` may decrypt first and only then take whatever lock guards
+    /// the tunnel, calling this to fold the result into its state. That split is
+    /// what lets the device keep its per-peer lock off the decryption path, as the
+    /// kernel decrypts on a workqueue holding only a keypair refcount.
+    ///
+    /// `session` must be the session the packet was decrypted with, and the packet
+    /// must have authenticated.
+    pub fn accept_decrypted_packet(&mut self, session: &Arc<session::Session>, decrypted: &Packet) {
+        // Authenticated, so it may confirm a session we were holding as `next`.
+        self.received_with_session(session);
+
+        self.timer_tick(TimerName::TimeLastPacketReceived);
+        if !decrypted.is_empty() {
+            self.timer_tick(TimerName::TimeLastDataPacketReceived);
+        }
+        self.rx_bytes += decrypted.as_bytes().len();
     }
 
     /// Return a new handshake if appropriate, or `None` otherwise.
@@ -453,26 +526,24 @@ impl<R: RngCore + Send> Tunn<R> {
     }
 
     fn estimate_loss(&self) -> f32 {
-        let session_idx = self.current;
-
         let mut weight = 9.0;
         let mut cur_avg = 0.0;
         let mut total_weight = 0.0;
 
-        for i in 0..N_SESSIONS {
-            if let Some(ref session) = self.sessions[session_idx.wrapping_sub(i) % N_SESSIONS] {
-                let (expected, received) = session.current_packet_cnt();
+        // `current` comes first, so the session actually carrying traffic
+        // dominates the estimate.
+        for session in self.sessions.iter() {
+            let (expected, received) = session.current_packet_cnt();
 
-                let loss = if expected == 0 {
-                    0.0
-                } else {
-                    1.0 - received as f32 / expected as f32
-                };
+            let loss = if expected == 0 {
+                0.0
+            } else {
+                1.0 - received as f32 / expected as f32
+            };
 
-                cur_avg += loss * weight;
-                total_weight += weight;
-                weight /= 3.0;
-            }
+            cur_avg += loss * weight;
+            total_weight += weight;
+            weight /= 3.0;
         }
 
         if total_weight == 0.0 {
@@ -550,6 +621,20 @@ mod tests {
     }
 
     fn create_two_tuns_with_keepalive(persistent_keepalive: Option<u16>) -> (Tunn, Tunn) {
+        create_two_tuns_with_tables(
+            IndexTable::from_os_rng(),
+            IndexTable::from_os_rng(),
+            persistent_keepalive,
+        )
+    }
+
+    /// Like [`create_two_tuns_with_keepalive`], but with caller-supplied index tables
+    /// so a test can look indices up the way the device does.
+    fn create_two_tuns_with_tables(
+        my_table: IndexTable,
+        their_table: IndexTable,
+        persistent_keepalive: Option<u16>,
+    ) -> (Tunn, Tunn) {
         let my_secret_key = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
         let my_public_key = x25519_dalek::PublicKey::from(&my_secret_key);
 
@@ -562,7 +647,7 @@ mod tests {
             their_public_key,
             None,
             persistent_keepalive,
-            IndexTable::from_os_rng(),
+            my_table,
             rate_limiter,
         );
 
@@ -572,7 +657,7 @@ mod tests {
             my_public_key,
             None,
             None,
-            IndexTable::from_os_rng(),
+            their_table,
             rate_limiter,
         );
 
@@ -851,8 +936,9 @@ mod tests {
         let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
 
         // Fast-forward the established session to its last usable counter value.
-        let slot = my_tun.current % N_SESSIONS;
-        my_tun.sessions[slot]
+        my_tun
+            .sessions
+            .current
             .as_ref()
             .expect("session established after handshake")
             .set_sending_key_counter(session::REJECT_AFTER_MESSAGES - 1);
@@ -902,6 +988,171 @@ mod tests {
         assert!(
             matches!(result, TunnResult::Err(WireGuardError::InvalidAeadTag)),
             "expected the rekey to fail on the diverged PSK, got {result:?}"
+        );
+    }
+
+    /// Encrypt one packet and report the receiver index it went out with.
+    ///
+    /// The index identifies the session used for *sending*, so it is a black-box
+    /// way to observe which session a tunnel considers current.
+    fn sent_receiver_idx(tun: &mut Tunn) -> u32 {
+        let packet = tun
+            .handle_outgoing_packet(create_ipv4_udp_packet().into_bytes(), None)
+            .expect("an established session should encrypt");
+        let WgKind::Data(data) = packet else {
+            panic!("expected an encrypted data packet, got {packet:?}");
+        };
+        data.header.receiver_idx.get()
+    }
+
+    /// Let the clock move far enough for a second handshake to be accepted.
+    ///
+    /// A handshake initiation carries a TAI64N timestamp that must be strictly
+    /// greater than the last one seen, which under a mocked clock requires an
+    /// explicit nudge. Session *promotion* deliberately does not depend on timing.
+    fn allow_second_handshake() {
+        #[cfg(feature = "mock_instant")]
+        MockClock::advance(Duration::from_millis(1));
+    }
+
+    /// A session that has been superseded by a rekey must still decrypt packets
+    /// that were already in flight on it, and receiving one must not drag the
+    /// peer back onto it for sending.
+    #[test]
+    fn previous_session_still_receives_after_rekey() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let idx_a = sent_receiver_idx(&mut their_tun);
+
+        // Encrypt on session A but hold the packet back, as if it were in flight.
+        let in_flight = my_tun
+            .handle_outgoing_packet(create_ipv4_udp_packet().into_bytes(), None)
+            .expect("session A should encrypt");
+
+        allow_second_handshake();
+        complete_handshake(&mut my_tun, &mut their_tun);
+
+        let idx_b = sent_receiver_idx(&mut their_tun);
+        assert_ne!(idx_a, idx_b, "the rekey should have produced a new session");
+
+        // The packet stranded on session A still decrypts.
+        let TunnResult::WriteToTunnel(_) = their_tun.handle_incoming_packet(in_flight) else {
+            panic!("a packet on the previous session should still decrypt");
+        };
+
+        assert_eq!(
+            sent_receiver_idx(&mut their_tun),
+            idx_b,
+            "receiving on the previous session must not change the sending session"
+        );
+    }
+
+    /// A responder may not send on a freshly negotiated session until it has
+    /// received authenticated data on it, because its handshake response may
+    /// have been lost. Only the initiator may adopt a session immediately.
+    #[test]
+    fn responder_adopts_new_session_only_after_authenticated_data() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        let idx_a = sent_receiver_idx(&mut their_tun);
+
+        allow_second_handshake();
+
+        // Negotiate session B, but withhold the initiator's confirming keepalive.
+        let TunnResult::WriteToNetwork(WgKind::Data(keepalive)) =
+            try_handshake(&mut my_tun, &mut their_tun)
+        else {
+            panic!("expected a keepalive after the handshake");
+        };
+
+        assert_eq!(
+            sent_receiver_idx(&mut their_tun),
+            idx_a,
+            "the responder must keep sending on the old session until the new one is confirmed"
+        );
+
+        // The keepalive is that confirmation.
+        parse_keepalive(&mut their_tun, keepalive);
+        assert_ne!(
+            sent_receiver_idx(&mut their_tun),
+            idx_a,
+            "the responder should adopt the session once data authenticates on it"
+        );
+    }
+
+    /// An established session is reachable from its index in a single lookup, and
+    /// the entry disappears the instant the session does.
+    ///
+    /// This is the property that makes the device's separate `peers_by_idx` map and
+    /// its periodic staleness sweep unnecessary: removal is driven by the owner's
+    /// destructor, as in the kernel's `keypair_free_kref`.
+    #[test]
+    fn session_is_reachable_by_index_until_dropped() {
+        let my_table = IndexTable::from_os_rng();
+        let (mut my_tun, mut their_tun) =
+            create_two_tuns_with_tables(my_table.clone(), IndexTable::from_os_rng(), None);
+        complete_handshake(&mut my_tun, &mut their_tun);
+
+        // The index their_tun sends to is my_tun's receiving index for the session.
+        let idx = sent_receiver_idx(&mut their_tun);
+        let session = my_table
+            .lookup_session(idx)
+            .expect("an established session should be reachable by its index");
+        assert_eq!(session.receiving_index.value(), idx);
+
+        // A handshake that has not yet produced a session must not answer a data
+        // lookup, mirroring the kernel's INDEX_HASHTABLE_KEYPAIR type mask.
+        let pending = create_handshake_init(&mut my_tun);
+        let pending_idx = pending.sender_idx.get();
+        assert!(
+            my_table.lookup_session(pending_idx).is_none(),
+            "an in-flight handshake index must not resolve to a session"
+        );
+
+        // Dropping the tunnel drops its sessions, which frees their indices.
+        drop(session);
+        drop(my_tun);
+        assert!(
+            my_table.lookup_session(idx).is_none(),
+            "a dropped session must not stay reachable"
+        );
+        assert!(
+            !my_table.in_use(idx),
+            "a dropped session must free its index"
+        );
+    }
+
+    /// The device resolves and decrypts a data packet before it locks the peer,
+    /// then folds the result in. That split must do everything the all-in-one
+    /// path does — in particular, confirm a session being held as `next`.
+    #[test]
+    fn decrypting_outside_the_tunnel_still_confirms_the_session() {
+        let their_table = IndexTable::from_os_rng();
+        let (mut my_tun, mut their_tun) =
+            create_two_tuns_with_tables(IndexTable::from_os_rng(), their_table.clone(), None);
+        complete_handshake(&mut my_tun, &mut their_tun);
+        let idx_a = sent_receiver_idx(&mut their_tun);
+
+        allow_second_handshake();
+        let TunnResult::WriteToNetwork(WgKind::Data(keepalive)) =
+            try_handshake(&mut my_tun, &mut their_tun)
+        else {
+            panic!("expected a keepalive after the handshake");
+        };
+
+        // Resolve and decrypt exactly as the device does: through the shared index
+        // table, with no access to the tunnel at all.
+        let session = their_table
+            .lookup_session(keepalive.header.receiver_idx.get())
+            .expect("the keepalive should name a registered session");
+        let plaintext = session
+            .receive_packet_data(keepalive)
+            .expect("the keepalive should decrypt");
+
+        their_tun.accept_decrypted_packet(&session, &plaintext);
+
+        assert_ne!(
+            sent_receiver_idx(&mut their_tun),
+            idx_a,
+            "folding in a packet decrypted outside the tunnel must confirm the session"
         );
     }
 

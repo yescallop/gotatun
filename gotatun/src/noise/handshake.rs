@@ -12,7 +12,7 @@
 
 use crate::crypto::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
 use crate::noise::errors::WireGuardError;
-use crate::noise::index_table::{Index, IndexTable};
+use crate::noise::index_table::{Index, IndexTable, Owner};
 use crate::noise::session::Session;
 use crate::packet::{Packet, WgCookieReply, WgHandshakeBase, WgHandshakeInit, WgHandshakeResp};
 #[cfg(not(feature = "mock_instant"))]
@@ -312,6 +312,11 @@ pub struct Handshake {
     params: NoiseParams,
     /// Shared table for session indices.
     index_table: IndexTable,
+    /// The peer that indices minted here belong to.
+    ///
+    /// Set once, immediately after the peer is constructed and long before any
+    /// index is minted, so lookups can name the peer without a second map.
+    index_owner: Option<Owner>,
     /// Allow to have two outgoing handshakes in flight, because sometimes we may receive a delayed
     /// response to a handshake with bad networks
     previous: HandshakeState,
@@ -458,6 +463,7 @@ impl Handshake {
         Handshake {
             params,
             index_table,
+            index_owner: None,
             previous: HandshakeState::None,
             state: HandshakeState::None,
             last_handshake_timestamp: Tai64N::zero(),
@@ -465,6 +471,16 @@ impl Handshake {
             cookies: Default::default(),
             last_rtt: None,
         }
+    }
+
+    /// Attribute every index minted from here on to `owner`.
+    ///
+    /// Called once, right after the peer this handshake belongs to is constructed.
+    /// No index can have been minted yet at that point — the first one is reserved
+    /// by a handshake, which cannot have started — so there is no window in which
+    /// an entry exists without its owner.
+    pub(super) fn set_index_owner(&mut self, owner: Owner) {
+        self.index_owner = Some(owner);
     }
 
     pub(crate) fn is_in_progress(&self) -> bool {
@@ -761,7 +777,7 @@ impl Handshake {
     pub(super) fn format_handshake_initiation(&mut self) -> crate::packet::Packet<WgHandshakeInit> {
         let mut handshake = WgHandshakeInit::new();
 
-        let local_index = self.index_table.new_index();
+        let local_index = self.index_table.new_index_owned(self.index_owner.clone());
         let local_index_val = local_index.value();
 
         // initiator.chaining_key = HASH(CONSTRUCTION)
@@ -858,7 +874,7 @@ impl Handshake {
 
         // responder.ephemeral_private = DH_GENERATE()
         let ephemeral_private = x25519::ReusableSecret::random_from_rng(rand_core::OsRng);
-        let local_index = self.index_table.new_index();
+        let local_index = self.index_table.new_index_owned(self.index_owner.clone());
         let local_index_val = local_index.value();
         // msg.message_type = 2
         // msg.reserved_zero = { 0, 0, 0 }

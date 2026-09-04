@@ -19,6 +19,7 @@ use crate::{
 use bytes::{Buf, BytesMut};
 use parking_lot::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use zerocopy::FromBytes;
 
 /// The maximum number of transport data messages that may be sent or received under a single
@@ -31,6 +32,12 @@ pub(super) const REJECT_AFTER_MESSAGES: u64 = u64::MAX - (1 << 13);
 pub struct Session {
     pub(crate) receiving_index: Index,
     sending_index: u32,
+    /// When this session was established, measured on the owning tunnel's clock.
+    ///
+    /// Held per session rather than in a slot-indexed array beside them, so that
+    /// expiry does not depend on where a session is stored. Mirrors the kernel's
+    /// `noise_symmetric_key.birthdate`.
+    birthdate: Duration,
     receiver: LessSafeKey,
     sender: LessSafeKey,
     sending_key_counter: AtomicU64,
@@ -195,7 +202,21 @@ impl Session {
             sender: LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &sending_key).unwrap()),
             sending_key_counter: AtomicU64::new(0),
             receiving_key_counter: Mutex::new(Default::default()),
+            birthdate: Duration::ZERO,
         }
+    }
+
+    /// Record when this session was established.
+    ///
+    /// Called by the tunnel as it installs the session, which is the only place
+    /// that knows the tunnel's clock.
+    pub(super) fn set_birthdate(&mut self, birthdate: Duration) {
+        self.birthdate = birthdate;
+    }
+
+    /// When this session was established, on the owning tunnel's clock.
+    pub(super) fn birthdate(&self) -> Duration {
+        self.birthdate
     }
 
     /// Returns true if receiving counter is good to use
@@ -279,7 +300,7 @@ impl Session {
     }
 
     /// Decapsulate `packet` and return the decrypted data.
-    pub(super) fn receive_packet_data(
+    pub fn receive_packet_data(
         &self,
         mut packet: Packet<WgData>,
     ) -> Result<Packet, WireGuardError> {

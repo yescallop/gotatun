@@ -111,7 +111,6 @@ pub struct Timers {
     /// Start time of the tunnel
     time_started: Instant,
     timers: [Duration; TimerName::Top as usize],
-    pub(super) session_timers: [Duration; super::N_SESSIONS],
     /// Time the first data packet was received without us sending anything back, if any.
     /// A passive keepalive is due `keepalive_timeout` after this time.
     want_keepalive: Option<Duration>,
@@ -144,7 +143,6 @@ impl Timers {
             is_initiator: false,
             time_started: Instant::now(),
             timers: Default::default(),
-            session_timers: Default::default(),
             want_keepalive: Default::default(),
             want_handshake: Default::default(),
             persistent_keepalive,
@@ -264,14 +262,8 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         }
     }
 
-    pub(super) fn timer_tick_session_established(
-        &mut self,
-        is_initiator: bool,
-        session_idx: usize,
-    ) {
+    pub(super) fn timer_tick_session_established(&mut self, is_initiator: bool) {
         self.timer_tick(TimeSessionEstablished);
-        self.timers.session_timers[session_idx % crate::noise::N_SESSIONS] =
-            self.timers[TimeCurrent];
         self.timers.is_initiator = is_initiator;
         self.timers.rekey_after_time = self.sample_timer(|p| &p.rekey_after_time);
     }
@@ -279,29 +271,28 @@ impl<R: rand::RngCore + Send> Tunn<R> {
     // We don't really clear the timers, but we set them to the current time to
     // so the reference time frame is the same
     pub(super) fn clear_all(&mut self) {
-        for session in &mut self.sessions {
-            *session = None;
-        }
+        self.sessions.clear();
 
         self.packet_queue.clear();
 
         self.timers.clear();
     }
 
-    fn update_session_timers(&mut self, time_now: Duration) {
-        let timers = &mut self.timers;
-
-        for (i, t) in timers.session_timers.iter_mut().enumerate() {
-            if time_now - *t > REJECT_AFTER_TIME {
-                // Forget about expired sesssions
-                if let Some(session) = self.sessions[i].take() {
-                    tracing::trace!(
-                        "SESSION_EXPIRED(REJECT_AFTER_TIME): {}",
-                        session.receiving_index
-                    );
-                }
-                *t = time_now;
+    fn expire_old_sessions(&mut self, time_now: Duration) {
+        // Each session carries its own birthdate, so expiry is a property of the
+        // session rather than of the place it is stored.
+        for slot in self.sessions.slots_mut() {
+            let Some(session) = slot.as_ref() else {
+                continue;
+            };
+            if time_now.saturating_sub(session.birthdate()) <= REJECT_AFTER_TIME {
+                continue;
             }
+            tracing::trace!(
+                "SESSION_EXPIRED(REJECT_AFTER_TIME): {}",
+                session.receiving_index
+            );
+            *slot = None;
         }
     }
 
@@ -320,7 +311,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         let now = self.timers.now();
         self.timers[TimeCurrent] = now;
 
-        self.update_session_timers(now);
+        self.expire_old_sessions(now);
 
         // Load timers only once:
         let session_established = self.timers[TimeSessionEstablished];
@@ -456,8 +447,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
     ///
     /// Returns `None` if no session has been established.
     pub fn time_since_last_handshake(&self) -> Option<Duration> {
-        let current_session = self.current;
-        if self.sessions[current_session % super::N_SESSIONS].is_some() {
+        if self.sessions.current.is_some() {
             let duration_since_tun_start = self.timers.now();
             let duration_since_session_established = self.timers[TimeSessionEstablished];
 

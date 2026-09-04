@@ -61,6 +61,27 @@ pub use peer::Peer;
 /// The number of handshakes per second to tolerate before using cookies
 const HANDSHAKE_RATE_LIMIT: u64 = 100;
 
+/// An incoming packet that has been resolved to a peer.
+///
+/// Data packets arrive here already decrypted, because that happens before the
+/// peer is locked; everything else still needs the tunnel to process it.
+enum Incoming {
+    Decrypted(Arc<crate::noise::session::Session>, crate::packet::Packet),
+    Handshake(WgKind),
+}
+
+/// Recover the peer an index table entry belongs to.
+///
+/// The noise layer stores the peer type-erased, because `Index` lives below the
+/// layer that defines what a peer is. Every owner this device installs is a
+/// `Mutex<PeerState>`, so the downcast is infallible in practice; a `None` here
+/// would mean an entry minted by some other device sharing the table.
+fn peer_from_index_owner(
+    owner: Arc<dyn std::any::Any + Send + Sync>,
+) -> Option<Arc<Mutex<PeerState>>> {
+    owner.downcast::<Mutex<PeerState>>().ok()
+}
+
 /// Maximum number of packet buffers that each channel may contain
 const MAX_PACKET_BUFS: usize = 4000;
 
@@ -124,7 +145,6 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
 
     peers: HashMap<x25519::PublicKey, Arc<Mutex<PeerState>>>,
     peers_by_ip: AllowedIps<Arc<Mutex<PeerState>>>,
-    peers_by_idx: parking_lot::Mutex<HashMap<u32, Arc<Mutex<PeerState>>>>,
     index_table: IndexTable,
 
     rate_limiter: Option<Arc<RateLimiter>>,
@@ -383,10 +403,8 @@ impl BitOrAssign for Reconfigure {
 impl<T: DeviceTransports> DeviceState<T> {
     async fn remove_peer(&mut self, pub_key: &x25519::PublicKey) -> Option<Arc<Mutex<PeerState>>> {
         if let Some(peer) = self.peers.remove(pub_key) {
-            // Remove all session index entries that point to this peer
-            self.peers_by_idx
-                .lock()
-                .retain(|_idx, p| !Arc::ptr_eq(&peer, p));
+            // The peer's index entries go with its sessions and handshake, which
+            // this `Arc` was the last owner of.
             self.peers_by_ip
                 .remove(&|p: &Arc<Mutex<PeerState>>| Arc::ptr_eq(&peer, p));
 
@@ -401,8 +419,15 @@ impl<T: DeviceTransports> DeviceState<T> {
     fn add_peer(&mut self, peer_builder: Peer) {
         let pub_key = peer_builder.public_key;
         let allowed_ips = peer_builder.allowed_ips.clone();
-        let peer = self.create_peer(peer_builder);
-        let peer = Arc::new(Mutex::new(peer));
+        // Build the peer inside its own `Arc` so the tunnel can attribute the session
+        // indices it mints to this peer. A lookup on the shared index table then
+        // yields the peer directly, the way the kernel's `index_hashtable_entry`
+        // carries its `peer` pointer.
+        let peer = Arc::new_cyclic(|weak: &std::sync::Weak<Mutex<PeerState>>| {
+            let mut peer = self.create_peer(peer_builder);
+            peer.tunnel.set_index_owner(weak.clone());
+            Mutex::new(peer)
+        });
 
         self.peers.insert(pub_key, Arc::clone(&peer));
 
@@ -532,24 +557,9 @@ impl<T: DeviceTransports> DeviceState<T> {
     fn clear_peers(&mut self) -> usize {
         let n = self.peers.len();
         self.peers.clear();
-        self.peers_by_idx.lock().clear();
         self.peers_by_ip.clear();
         // TODO: tear down connection?
         n
-    }
-
-    /// If `packet` is a handshake init or response, register its `sender_idx` in `peers_by_idx`.
-    fn register_handshake_idx(
-        peers_by_idx: &parking_lot::Mutex<HashMap<u32, Arc<Mutex<PeerState>>>>,
-        packet: &WgKind,
-        peer: &Arc<Mutex<PeerState>>,
-    ) {
-        let sender_idx = match packet {
-            WgKind::HandshakeInit(p) => p.sender_idx.get(),
-            WgKind::HandshakeResp(p) => p.sender_idx.get(),
-            _ => return,
-        };
-        peers_by_idx.lock().insert(sender_idx, Arc::clone(peer));
     }
 
     #[instrument(level = Level::TRACE, skip_all)]
@@ -559,16 +569,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                 break;
             };
             let device = device.read().await;
-            // Remove stale session indices.
-            //
-            // `device.index_table` is a singleton which identifies ongoing handshakes and active sessions.
-            // Once a session is stale it is dropped (see `update_session_timers`), and its
-            // associated index is freed from the table.
-            device
-                .peers_by_idx
-                .lock()
-                .retain(|idx, _| device.index_table.in_use(*idx));
-
             // TODO: pass in peers instead?
             let peer_map = &device.peers;
 
@@ -582,9 +582,6 @@ impl<T: DeviceTransports> DeviceState<T> {
 
                 match p.update_timers() {
                     Ok(Some(packet)) => {
-                        // Register sender_idx from outgoing handshake packets
-                        Self::register_handshake_idx(&device.peers_by_idx, &packet, peer);
-
                         drop(p);
 
                         // NOTE: we don't bother with triggering TunnelRecv DAITA events here.
@@ -643,28 +640,60 @@ impl<T: DeviceTransports> DeviceState<T> {
 
             let device_guard = device.read().await;
             let peers = &device_guard.peers;
-            let peer = match &parsed_packet {
-                WgKind::HandshakeInit(p) => parse_handshake_anon(&private_key, &public_key, p)
+            // Resolve the packet to its peer, and decrypt it if it is data.
+            //
+            // A data packet is decrypted here, *before* the peer is locked: a
+            // session is self-contained and internally synchronised, so decryption
+            // needs nothing from the peer, and only the bookkeeping afterwards
+            // does. This keeps the AEAD out of the peer's critical section, as the
+            // kernel decrypts holding only a refcount on the keypair.
+            //
+            // One table answers every index, and the lookup used says what the
+            // index is allowed to identify, mirroring the kernel's type mask:
+            //
+            // - a data packet must name a session (`INDEX_HASHTABLE_KEYPAIR`);
+            // - a handshake response must name a handshake still in flight
+            //   (`INDEX_HASHTABLE_HANDSHAKE`), so a completed one cannot be
+            //   re-answered;
+            // - a cookie reply may name either, because it answers a handshake
+            //   message that may well have completed while it was in flight.
+            let resolved = match parsed_packet {
+                WgKind::HandshakeInit(p) => parse_handshake_anon(&private_key, &public_key, &p)
                     .ok()
                     .and_then(|hh| peers.get(&x25519::PublicKey::from(hh.peer_static_public)))
-                    .cloned(),
+                    .cloned()
+                    .map(|peer| (peer, Incoming::Handshake(WgKind::HandshakeInit(p)))),
                 WgKind::HandshakeResp(p) => device_guard
-                    .peers_by_idx
-                    .lock()
-                    .get(&p.receiver_idx.get())
-                    .cloned(),
+                    .index_table
+                    .lookup_handshake_owner(p.receiver_idx.get())
+                    .and_then(peer_from_index_owner)
+                    .map(|peer| (peer, Incoming::Handshake(WgKind::HandshakeResp(p)))),
                 WgKind::CookieReply(p) => device_guard
-                    .peers_by_idx
-                    .lock()
-                    .get(&p.receiver_idx.get())
-                    .cloned(),
-                WgKind::Data(p) => device_guard
-                    .peers_by_idx
-                    .lock()
-                    .get(&p.header.receiver_idx.get())
-                    .cloned(),
+                    .index_table
+                    .lookup_owner(p.receiver_idx.get())
+                    .and_then(peer_from_index_owner)
+                    .map(|peer| (peer, Incoming::Handshake(WgKind::CookieReply(p)))),
+                WgKind::Data(p) => {
+                    let resolved = device_guard
+                        .index_table
+                        .lookup_session_and_owner(p.header.receiver_idx.get())
+                        .and_then(|(session, owner)| {
+                            Some((peer_from_index_owner(owner)?, session))
+                        });
+                    match resolved {
+                        Some((peer, session)) => match session.receive_packet_data(p) {
+                            Ok(plaintext) => Some((peer, Incoming::Decrypted(session, plaintext))),
+                            // Failed to authenticate; drop it without touching the peer.
+                            Err(_) => continue,
+                        },
+                        None => None,
+                    }
+                }
             };
-            let Some(peer_arc) = peer else { continue };
+            let Some((peer_arc, incoming)) = resolved else {
+                continue;
+            };
+
             let mut peer = peer_arc.lock().await;
 
             #[cfg(feature = "daita")]
@@ -672,7 +701,15 @@ impl<T: DeviceTransports> DeviceState<T> {
             #[cfg(not(feature = "daita"))]
             let PeerState { tunnel, .. } = &mut *peer;
 
-            match tunnel.handle_incoming_packet(parsed_packet) {
+            let result = match incoming {
+                Incoming::Decrypted(session, plaintext) => {
+                    tunnel.accept_decrypted_packet(&session, &plaintext);
+                    TunnResult::WriteToTunnel(plaintext)
+                }
+                Incoming::Handshake(packet) => tunnel.handle_incoming_packet(packet),
+            };
+
+            match result {
                 TunnResult::Done => {
                     // Don't update the peer endpoint on cookie replies, for consistency
                     // with both the Linux kernel and wireguard-go.
@@ -680,9 +717,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                 TunnResult::Err(_) => continue,
                 // Flush pending queue
                 TunnResult::WriteToNetwork(packet) => {
-                    // Register sender_idx from outgoing handshake packets
-                    Self::register_handshake_idx(&device_guard.peers_by_idx, &packet, &peer_arc);
-
                     // TODO: does this end up with the packets being out-of-order?
                     let packets =
                         std::iter::once(packet).chain(tunnel.get_queued_packets(&mut tun_mtu));
@@ -830,9 +864,6 @@ impl<T: DeviceTransports> DeviceState<T> {
                 let Some(packet) = tunnel.handle_outgoing_packet(packet, Some(&mut tun_mtu)) else {
                     continue;
                 };
-
-                // Register sender_idx from outgoing handshake packets
-                Self::register_handshake_idx(&device_guard.peers_by_idx, &packet, &peer_arc);
 
                 #[cfg(feature = "daita")]
                 let packet = match daita {
