@@ -81,6 +81,13 @@ See [UAPI](./UAPI.md) for extensions to the `wg` configuration protocol.
 
 ---
 
+## Parity with the Linux kernel
+
+See [kernel parity](./KERNEL-PARITY.md) for where GotaTun matches
+`drivers/net/wireguard`, where it deliberately differs, and where it is weaker.
+
+---
+
 ## Audits
 
 Independent security audits have been conducted on the project.
