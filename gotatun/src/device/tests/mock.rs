@@ -18,7 +18,7 @@ use std::{
 use duplicate::duplicate;
 use either::for_both;
 use futures::{Stream, StreamExt};
-use ipnetwork::Ipv4Network;
+use ipnet::Ipv4Net;
 use rand::random;
 use tokio::sync::{
     Mutex, broadcast,
@@ -132,11 +132,11 @@ pub async fn device_pair() -> (MockDevice, MockDevice, MockEavesdropper) {
 
     let peer_a = Peer::new(pubkey_a)
         .with_endpoint((endpoint_a, port).into())
-        .with_allowed_ip(Ipv4Network::new(Ipv4Addr::UNSPECIFIED, 0).unwrap().into());
+        .with_allowed_ip(Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).unwrap().into());
 
     let peer_b = Peer::new(pubkey_b)
         .with_endpoint((endpoint_b, port).into())
-        .with_allowed_ip(Ipv4Network::new(Ipv4Addr::UNSPECIFIED, 0).unwrap().into());
+        .with_allowed_ip(Ipv4Net::new(Ipv4Addr::UNSPECIFIED, 0).unwrap().into());
 
     let device_a = DeviceBuilder::new()
         .with_private_key(privkey_a)

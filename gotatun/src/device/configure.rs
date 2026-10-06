@@ -12,7 +12,7 @@
 //! Configuration and inspection interface for WireGuard devices.
 use std::{collections::HashSet, net::SocketAddr, sync::Arc, time::Duration};
 
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::device::Error;
@@ -96,7 +96,7 @@ pub struct PeerMut {
     keepalive: Update<u16>,
 
     clear_allowed_ips: bool,
-    add_allowed_ips: Vec<IpNetwork>,
+    add_allowed_ips: Vec<IpNet>,
 }
 
 impl PeerMut {
@@ -122,13 +122,13 @@ impl PeerMut {
 
     /// Add a single allowed IP network for this peer.
     /// Can be called multiple times.
-    pub fn add_allowed_ip(&mut self, allowed_ip: impl Into<IpNetwork>) {
+    pub fn add_allowed_ip(&mut self, allowed_ip: impl Into<IpNet>) {
         self.add_allowed_ips.push(allowed_ip.into());
     }
 
     /// Add multiple allowed IP networks for this peer.
     /// Can be called multiple times.
-    pub fn add_allowed_ips(&mut self, allowed_ips: impl IntoIterator<Item = impl Into<IpNetwork>>) {
+    pub fn add_allowed_ips(&mut self, allowed_ips: impl IntoIterator<Item = impl Into<IpNet>>) {
         self.add_allowed_ips
             .extend(allowed_ips.into_iter().map(Into::into));
     }
@@ -341,7 +341,7 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
         for allowed_ip in add_allowed_ips {
             existing_peer
                 .allowed_ips
-                .insert(allowed_ip.network(), allowed_ip.prefix(), ());
+                .insert(allowed_ip.network(), allowed_ip.prefix_len(), ());
         }
 
         // Update device.peers_by_ip by clearing all entries that refer to this peer and
@@ -358,7 +358,7 @@ impl<T: DeviceTransports> DeviceWrite<'_, T> {
         for (_, allowed_ip) in existing_peer.allowed_ips.iter() {
             self.device.peers_by_ip.insert(
                 allowed_ip.network(),
-                allowed_ip.prefix(),
+                allowed_ip.prefix_len(),
                 Arc::clone(&existing_peer_arc),
             );
         }

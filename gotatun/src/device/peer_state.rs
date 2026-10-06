@@ -10,7 +10,7 @@
 //
 // SPDX-License-Identifier: MPL-2.0
 
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 
 use std::net::SocketAddr;
 
@@ -48,7 +48,7 @@ impl PeerState {
     pub fn new(
         tunnel: Tunn,
         endpoint: Option<SocketAddr>,
-        allowed_ips: &[IpNetwork],
+        allowed_ips: &[IpNet],
         #[cfg(feature = "daita")] daita_settings: Option<DaitaSettings>,
     ) -> PeerState {
         Self {
@@ -113,7 +113,7 @@ impl PeerState {
         self.endpoint.addr = Some(addr);
     }
 
-    pub fn allowed_ips(&self) -> impl Iterator<Item = IpNetwork> + '_ {
+    pub fn allowed_ips(&self) -> impl Iterator<Item = IpNet> + '_ {
         self.allowed_ips.iter().map(|((), network)| network)
     }
 

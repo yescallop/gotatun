@@ -11,7 +11,7 @@
 
 use std::net::SocketAddr;
 
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 use x25519_dalek::PublicKey;
 
 #[cfg(feature = "daita")]
@@ -31,7 +31,7 @@ pub struct Peer {
     /// handshake from that peer.
     pub endpoint: Option<SocketAddr>,
     /// List of IP networks that are allowed to be routed through this peer.
-    pub allowed_ips: Vec<IpNetwork>,
+    pub allowed_ips: Vec<IpNet>,
     // TODO: zeroize
     /// Optional preshared key for additional security.
     pub preshared_key: Option<[u8; 32]>,
@@ -72,13 +72,13 @@ impl Peer {
     }
 
     /// Add a single allowed IP network for this peer.
-    pub fn with_allowed_ip(mut self, network: IpNetwork) -> Self {
+    pub fn with_allowed_ip(mut self, network: IpNet) -> Self {
         self.allowed_ips.push(network);
         self
     }
 
     /// Add multiple allowed IP networks for this peer.
-    pub fn with_allowed_ips(mut self, networks: impl IntoIterator<Item = IpNetwork>) -> Self {
+    pub fn with_allowed_ips(mut self, networks: impl IntoIterator<Item = IpNet>) -> Self {
         self.allowed_ips.extend(networks);
         self
     }

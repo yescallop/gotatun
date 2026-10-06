@@ -20,7 +20,7 @@ use std::{
 };
 
 use eyre::{WrapErr, bail, ensure, eyre};
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 use typed_builder::TypedBuilder;
 
 use crate::serialization::KeyBytes;
@@ -219,7 +219,7 @@ pub struct Peer {
     /// added peer entry. If an identical value already exists as part of a prior peer, the allowed
     /// IP entry will be removed from that peer and added to this peer.
     #[builder(default)]
-    pub allowed_ip: Vec<IpNetwork>,
+    pub allowed_ip: Vec<IpNet>,
 
     /// DAITA settings for this peer.
     #[cfg(feature = "daita-uapi")]
@@ -471,7 +471,7 @@ impl Display for GetPeer {
         }
 
         for allowed_ip in allowed_ip {
-            writeln!(f, "allowed_ip={}/{}", allowed_ip.ip(), allowed_ip.prefix())?;
+            writeln!(f, "allowed_ip={allowed_ip}")?;
         }
 
         Ok(())

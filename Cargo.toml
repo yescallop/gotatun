@@ -37,7 +37,7 @@ hex = "0.4.3"
 hmac = "0.12.1"
 ip_network = "0.4.1"
 ip_network_table = "0.2.0"
-ipnetwork = "0.21.1"
+ipnet = "2.11.0"
 libc = "0.2.180"
 maybenot = "2.2.2"
 mimalloc = { version = "0.1", default-features = false }

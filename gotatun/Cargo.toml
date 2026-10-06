@@ -48,7 +48,7 @@ futures = { workspace = true }
 hmac = { workspace = true }
 ip_network = { workspace = true }
 ip_network_table = { workspace = true }
-ipnetwork = { workspace = true }
+ipnet = { workspace = true }
 libc = { workspace = true }
 maybenot = { workspace = true, optional = true }
 mock_instant = { workspace = true, optional = true }

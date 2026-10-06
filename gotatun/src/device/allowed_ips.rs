@@ -11,7 +11,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use ip_network_table::IpNetworkTable;
-use ipnetwork::IpNetwork;
+use ipnet::IpNet;
 
 use std::iter::FromIterator;
 use std::net::IpAddr;
@@ -23,12 +23,12 @@ pub struct AllowedIps<D = ()> {
     ips: IpNetworkTable<D>,
 }
 
-impl<'a, D> FromIterator<(&'a IpNetwork, D)> for AllowedIps<D> {
-    fn from_iter<I: IntoIterator<Item = (&'a IpNetwork, D)>>(iter: I) -> Self {
+impl<'a, D> FromIterator<(&'a IpNet, D)> for AllowedIps<D> {
+    fn from_iter<I: IntoIterator<Item = (&'a IpNet, D)>>(iter: I) -> Self {
         let mut allowed_ips = AllowedIps::new();
 
         for (ip, data) in iter {
-            allowed_ips.insert(ip.network(), ip.prefix(), data);
+            allowed_ips.insert(ip.network(), ip.prefix_len(), data);
         }
 
         allowed_ips
@@ -60,15 +60,15 @@ impl<D> AllowedIps<D> {
         self.ips.retain(|_, v| !predicate(v));
     }
 
-    pub fn remove_network(&mut self, network: IpNetwork) {
-        let network = ip_network::IpNetwork::new_truncate(network.ip(), network.prefix())
+    pub fn remove_network(&mut self, network: IpNet) {
+        let network = ip_network::IpNetwork::new_truncate(network.addr(), network.prefix_len())
             .expect("cidr is valid length");
         self.ips.remove(network);
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&D, IpNetwork)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&D, IpNet)> {
         self.ips.iter().map(|(ip_network, d)| {
-            let ip_network = IpNetwork::new(ip_network.network_address(), ip_network.netmask())
+            let ip_network = IpNet::new(ip_network.network_address(), ip_network.netmask())
                 .expect("cidr is valid length");
             (d, ip_network)
         })
@@ -120,31 +120,19 @@ mod tests {
         let mut map_iter = map.iter();
         assert_eq!(
             map_iter.next(),
-            Some((
-                &'6',
-                IpNetwork::new(IpAddr::from([45, 25, 15, 0]), 30).unwrap()
-            ))
+            Some((&'6', IpNet::new(IpAddr::from([45, 25, 15, 0]), 30).unwrap()))
         );
         assert_eq!(
             map_iter.next(),
-            Some((
-                &'2',
-                IpNetwork::new(IpAddr::from([127, 0, 0, 0]), 16).unwrap()
-            ))
+            Some((&'2', IpNet::new(IpAddr::from([127, 0, 0, 0]), 16).unwrap()))
         );
         assert_eq!(
             map_iter.next(),
-            Some((
-                &'3',
-                IpNetwork::new(IpAddr::from([127, 1, 15, 0]), 24).unwrap()
-            ))
+            Some((&'3', IpNet::new(IpAddr::from([127, 1, 15, 0]), 24).unwrap()))
         );
         assert_eq!(
             map_iter.next(),
-            Some((
-                &'4',
-                IpNetwork::new(IpAddr::from([255, 1, 15, 0]), 24).unwrap()
-            ))
+            Some((&'4', IpNet::new(IpAddr::from([255, 1, 15, 0]), 24).unwrap()))
         );
         assert_eq!(map_iter.next(), None);
     }
@@ -155,51 +143,33 @@ mod tests {
         let mut map_iter = map.iter();
         assert_eq!(
             map_iter.next(),
-            Some((
-                &'6',
-                IpNetwork::new(IpAddr::from([45, 25, 15, 0]), 30).unwrap()
-            ))
+            Some((&'6', IpNet::new(IpAddr::from([45, 25, 15, 0]), 30).unwrap()))
         );
         assert_eq!(
             map_iter.next(),
-            Some((
-                &'5',
-                IpNetwork::new(IpAddr::from([60, 25, 15, 1]), 32).unwrap()
-            ))
+            Some((&'5', IpNet::new(IpAddr::from([60, 25, 15, 1]), 32).unwrap()))
         );
         assert_eq!(
             map_iter.next(),
-            Some((
-                &'2',
-                IpNetwork::new(IpAddr::from([127, 0, 0, 0]), 16).unwrap()
-            ))
+            Some((&'2', IpNet::new(IpAddr::from([127, 0, 0, 0]), 16).unwrap()))
         );
         assert_eq!(
             map_iter.next(),
-            Some((
-                &'1',
-                IpNetwork::new(IpAddr::from([127, 0, 0, 1]), 32).unwrap()
-            ))
+            Some((&'1', IpNet::new(IpAddr::from([127, 0, 0, 1]), 32).unwrap()))
         );
         assert_eq!(
             map_iter.next(),
-            Some((
-                &'3',
-                IpNetwork::new(IpAddr::from([127, 1, 15, 0]), 24).unwrap()
-            ))
+            Some((&'3', IpNet::new(IpAddr::from([127, 1, 15, 0]), 24).unwrap()))
         );
         assert_eq!(
             map_iter.next(),
-            Some((
-                &'4',
-                IpNetwork::new(IpAddr::from([255, 1, 15, 0]), 24).unwrap()
-            ))
+            Some((&'4', IpNet::new(IpAddr::from([255, 1, 15, 0]), 24).unwrap()))
         );
         assert_eq!(
             map_iter.next(),
             Some((
                 &'7',
-                IpNetwork::new(IpAddr::from([553, 0, 0, 1, 0, 0, 0, 0]), 128).unwrap()
+                IpNet::new(IpAddr::from([553, 0, 0, 1, 0, 0, 0, 0]), 128).unwrap()
             ))
         );
         assert_eq!(map_iter.next(), None);
@@ -407,24 +377,15 @@ mod tests {
         let mut map_iter = map.iter();
         assert_eq!(
             map_iter.next(),
-            Some((
-                &'1',
-                IpNetwork::new(IpAddr::from([10, 111, 0, 1]), 32).unwrap()
-            ))
+            Some((&'1', IpNet::new(IpAddr::from([10, 111, 0, 1]), 32).unwrap()))
         );
         assert_eq!(
             map_iter.next(),
-            Some((
-                &'2',
-                IpNetwork::new(IpAddr::from([10, 111, 0, 2]), 32).unwrap()
-            ))
+            Some((&'2', IpNet::new(IpAddr::from([10, 111, 0, 2]), 32).unwrap()))
         );
         assert_eq!(
             map_iter.next(),
-            Some((
-                &'3',
-                IpNetwork::new(IpAddr::from([10, 111, 0, 3]), 32).unwrap()
-            ))
+            Some((&'3', IpNet::new(IpAddr::from([10, 111, 0, 3]), 32).unwrap()))
         );
         assert_eq!(map_iter.next(), None);
     }

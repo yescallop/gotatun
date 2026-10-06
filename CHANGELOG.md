@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+### Changed
+- Replace crate `ipnetwork` with `ipnet` in public API.
+- Reject UAPI `allowed_ip` values without a prefix length or with a netmask in place of one.
+  Such values were previously accepted, as host routes and as their equivalent prefix length,
+  but the UAPI requires `IP/cidr`.
+
 ### Fixed
 - Bind the UAPI unix socket at `/var/run/wireguard/<name>.sock` without a doubled
   slash in the path. The kernel previously reported the bound path as

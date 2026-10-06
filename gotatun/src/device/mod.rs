@@ -408,7 +408,7 @@ impl<T: DeviceTransports> DeviceState<T> {
 
         for allowed_ip in allowed_ips {
             let addr = allowed_ip.network();
-            let cidr = allowed_ip.prefix();
+            let cidr = allowed_ip.prefix_len();
             self.peers_by_ip.insert(addr, cidr, Arc::clone(&peer));
         }
 
