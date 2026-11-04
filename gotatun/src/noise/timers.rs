@@ -112,6 +112,9 @@ pub struct Timers {
     time_started: Instant,
     timers: [Duration; TimerName::Top as usize],
     pub(super) session_timers: [Duration; super::N_SESSIONS],
+    /// When a session was last established, if ever. Unlike the timers, [`Self::clear`] leaves this
+    /// alone, so that it outlives the sessions.
+    last_handshake: Option<Duration>,
     /// Time the first data packet was received without us sending anything back, if any.
     /// A passive keepalive is due `keepalive_timeout` after this time.
     want_keepalive: Option<Duration>,
@@ -145,6 +148,7 @@ impl Timers {
             time_started: Instant::now(),
             timers: Default::default(),
             session_timers: Default::default(),
+            last_handshake: None,
             want_keepalive: Default::default(),
             want_handshake: Default::default(),
             persistent_keepalive,
@@ -272,6 +276,7 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         self.timer_tick(TimeSessionEstablished);
         self.timers.session_timers[session_idx % crate::noise::N_SESSIONS] =
             self.timers[TimeCurrent];
+        self.timers.last_handshake = Some(self.timers[TimeCurrent]);
         self.timers.is_initiator = is_initiator;
         self.timers.rekey_after_time = self.sample_timer(|p| &p.rekey_after_time);
     }
@@ -452,19 +457,13 @@ impl<R: rand::RngCore + Send> Tunn<R> {
         Ok(None)
     }
 
-    /// Get the time elapsed since the last successful handshake.
+    /// Get the time elapsed since the last successful handshake, whether or not its session is
+    /// still there.
     ///
-    /// Returns `None` if no session has been established.
+    /// Returns `None` if no session has ever been established.
     pub fn time_since_last_handshake(&self) -> Option<Duration> {
-        let current_session = self.current;
-        if self.sessions[current_session % super::N_SESSIONS].is_some() {
-            let duration_since_tun_start = self.timers.now();
-            let duration_since_session_established = self.timers[TimeSessionEstablished];
-
-            Some(duration_since_tun_start.saturating_sub(duration_since_session_established))
-        } else {
-            None
-        }
+        let last_handshake = self.timers.last_handshake?;
+        Some(self.timers.now().saturating_sub(last_handshake))
     }
 
     /// Whether the current session exists and is not yet due for rekeying.

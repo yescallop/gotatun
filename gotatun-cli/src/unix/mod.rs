@@ -173,7 +173,7 @@ fn with_tokio_runtime(f: impl Future<Output = Result<()>>) -> Result<()> {
     rt.block_on(f)
 }
 
-async fn wait_for_shutdown(mut device: Device<DefaultDeviceTransports>) {
+async fn wait_for_shutdown(device: Device<DefaultDeviceTransports>) {
     let mut sigint = signal(SignalKind::interrupt()).expect("Failed to set up SIGINT handler");
     let mut sigterm = signal(SignalKind::terminate()).expect("Failed to set up SIGTERM handler");
 

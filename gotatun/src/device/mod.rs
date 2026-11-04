@@ -20,6 +20,7 @@ pub mod daita;
 mod integration_tests;
 mod peer;
 mod peer_state;
+mod router;
 #[cfg(test)]
 mod tests;
 mod transports;
@@ -30,7 +31,7 @@ use builder::Nul;
 use futures::TryFutureExt;
 use std::collections::HashMap;
 use std::io::{self};
-use std::net::{IpAddr, Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::ops::BitOrAssign;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -43,7 +44,7 @@ use crate::noise::errors::WireGuardError;
 use crate::noise::handshake::parse_handshake_anon;
 use crate::noise::rate_limiter::RateLimiter;
 use crate::noise::{Tunn, TunnResult};
-use crate::packet::{PacketBufPool, WgKind};
+use crate::packet::{Ip, Packet, PacketBufPool, WgKind};
 use crate::task::Task;
 use crate::tun::{IpRecv, IpSend, MtuWatcher};
 use crate::udp::buffer::{BufferedUdpReceive, BufferedUdpSend};
@@ -57,6 +58,7 @@ pub use crate::device::transports::DefaultDeviceTransports;
 pub use crate::device::transports::DeviceTransports;
 pub use builder::DeviceBuilder;
 pub use peer::Peer;
+pub use router::{Router, Verdict};
 
 /// The number of handshakes per second to tolerate before using cookies
 const HANDSHAKE_RATE_LIMIT: u64 = 100;
@@ -140,6 +142,9 @@ pub(crate) struct DeviceState<T: DeviceTransports> {
     index_table: IndexTable,
 
     rate_limiter: Option<Arc<RateLimiter>>,
+
+    /// Decides where packets go, if set, in place of `peers_by_ip`.
+    router: Option<Arc<dyn Router>>,
 
     port: u16,
     udp_factory: T::UdpTransportFactory,
@@ -241,6 +246,7 @@ impl<T: DeviceTransports> Connection<T> {
             DeviceState::handle_outgoing(
                 Arc::downgrade(&device_arc),
                 buffered_ip_rx,
+                buffered_ip_tx.clone(),
                 buffered_udp_tx.clone(),
                 pool.clone(),
             )
@@ -276,7 +282,7 @@ impl<T: DeviceTransports> Connection<T> {
 
 impl<T: DeviceTransports> Device<T> {
     /// Stop tunneling traffic and shut down the [`Device`].
-    pub async fn stop(self) {
+    pub async fn stop(&self) {
         Self::stop_inner(self.inner.clone()).await
     }
 
@@ -395,9 +401,46 @@ impl<T: DeviceTransports> Device<T> {
         completed.changed().await.map_err(|_| Error::PeerNotFound)
     }
 
+    /// Encapsulate `packet` and send it to the peer with `public_key`.
+    ///
+    /// This goes straight to the UDP socket, rather than through the queue that forwarded traffic
+    /// shares, so it suits control traffic and packets carrying a transmit timestamp. As with any
+    /// outgoing packet, if there is no session, a handshake is started, and the packet is queued,
+    /// or dropped if the device has a router (see [`Router`]). If the peer has no endpoint, it is
+    /// dropped.
+    ///
+    /// Returns [`Error::PeerNotFound`] if the peer does not exist, and [`Error::NotConnected`] if
+    /// the device has no active connection.
+    pub async fn send_to_peer(
+        &self,
+        public_key: &x25519::PublicKey,
+        packet: Packet<Ip>,
+    ) -> Result<(), Error> {
+        let device = self.inner.read().await;
+        let udp = device
+            .connection
+            .as_ref()
+            .ok_or(Error::NotConnected)?
+            .udp
+            .clone();
+        let peer_arc = device.peers.get(public_key).ok_or(Error::PeerNotFound)?;
+        let mut tun_mtu = device.tun_rx_mtu.clone();
+
+        let Some((packet, endpoint_addr)) =
+            device.encapsulate(peer_arc, packet, &mut tun_mtu).await
+        else {
+            return Ok(());
+        };
+        drop(device);
+
+        udp.send_to(packet, endpoint_addr).await?;
+        Ok(())
+    }
+
     /// Wait until an unrecoverable error occurs.
-    pub async fn wait(&mut self) {
+    pub async fn wait(&self) {
         self.fatal_error
+            .clone()
             .wait_for(|err| err.is_some())
             .await
             .expect("Sender will not be dropped while Self exists");
@@ -494,6 +537,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         }
 
         PeerState::new(
+            peer_builder.public_key,
             tunn,
             peer_builder.endpoint,
             peer_builder.allowed_ips.as_slice(),
@@ -606,6 +650,63 @@ impl<T: DeviceTransports> DeviceState<T> {
         peers_by_idx.lock().insert(sender_idx, Arc::clone(peer));
     }
 
+    /// Encapsulate `packet` for `peer_arc`, returning what to send and where to send it, if
+    /// anything: there is nothing to send if the peer has no endpoint, or if the packet was queued,
+    /// or with a router dropped, while a handshake is already in progress.
+    async fn encapsulate(
+        &self,
+        peer_arc: &Arc<Mutex<PeerState>>,
+        packet: Packet<Ip>,
+        tun_mtu: &mut MtuWatcher,
+    ) -> Option<(Packet, SocketAddr)> {
+        let mut peer = peer_arc.lock().await;
+        let Some(peer_addr) = peer.endpoint().addr else {
+            // TODO: Implement the following error handling from section 3 of the
+            // whitepaper: If [peer_addr] matches no peer, it is dropped, and the sender is
+            // informed by a standard ICMP “no route to host” packet, as well as returning
+            // -ENOKEY to user space.
+            //
+            // A router chooses the peer itself, and a peer that has yet to contact us is not an
+            // error then, so this would only be noise.
+            if self.router.is_none() {
+                tracing::error!("No endpoint");
+            }
+            return None;
+        };
+
+        #[cfg(feature = "daita")]
+        let PeerState { tunnel, daita, .. } = &mut *peer;
+        #[cfg(not(feature = "daita"))]
+        let PeerState { tunnel, .. } = &mut *peer;
+
+        #[cfg(feature = "daita")]
+        let packet = match daita {
+            Some(daita) => daita.on_normal_sent(packet),
+            None => packet.into(),
+        };
+        #[cfg(not(feature = "daita"))]
+        let packet = packet.into();
+
+        let packet = if self.router.is_some() {
+            tunnel.handle_outgoing_packet_unqueued(packet, tun_mtu)?
+        } else {
+            tunnel.handle_outgoing_packet(packet, Some(tun_mtu))?
+        };
+
+        // Register sender_idx from outgoing handshake packets
+        Self::register_handshake_idx(&self.peers_by_idx, &packet, peer_arc);
+
+        #[cfg(feature = "daita")]
+        let packet = match daita {
+            None => packet.into(),
+            Some(daita) => daita.on_tunnel_sent(packet)?.into(),
+        };
+        #[cfg(not(feature = "daita"))]
+        let packet = packet.into();
+
+        Some((packet, peer_addr))
+    }
+
     #[instrument(level = Level::TRACE, skip_all)]
     async fn handle_timers(device: Weak<RwLock<Self>>, udp: impl UdpSend) {
         loop {
@@ -672,7 +773,7 @@ impl<T: DeviceTransports> DeviceState<T> {
         mut udp_rx: impl UdpRecv,
         mut packet_pool: PacketBufPool,
     ) -> Result<(), Error> {
-        let (private_key, public_key, rate_limiter, mut tun_mtu) = {
+        let (private_key, public_key, rate_limiter, router, mut tun_mtu) = {
             let Some(device) = device.upgrade() else {
                 return Ok(());
             };
@@ -680,8 +781,9 @@ impl<T: DeviceTransports> DeviceState<T> {
 
             let (private_key, public_key) = device.key_pair.clone().expect("Key not set");
             let rate_limiter = device.rate_limiter.clone().unwrap();
+            let router = device.router.clone();
             let tun_mtu = device.tun_rx_mtu.clone();
-            (private_key, public_key, rate_limiter, tun_mtu)
+            (private_key, public_key, rate_limiter, router, tun_mtu)
         };
 
         loop {
@@ -778,6 +880,42 @@ impl<T: DeviceTransports> DeviceState<T> {
                     if packet.is_empty() {
                         continue;
                     }
+
+                    if let Some(router) = &router {
+                        // A router does its own parsing, as `try_into_ipvx` rejects IPv4 options.
+                        let Ok(packet) = packet.try_into_ip() else {
+                            continue;
+                        };
+
+                        // The verdict can name this peer again, so don't hold on to its lock.
+                        let from = peer.public_key;
+                        drop(peer);
+
+                        match router.route_from_peer(&from, packet, &mut tun_mtu) {
+                            Verdict::ToTun(packet) => {
+                                tun_tx.send(packet).await.map_err(Error::IoError)?;
+                            }
+                            Verdict::ToPeer(to, packet) => {
+                                let Some(to) = peers.get(&to) else {
+                                    continue;
+                                };
+                                let Some((packet, endpoint_addr)) =
+                                    device_guard.encapsulate(to, packet, &mut tun_mtu).await
+                                else {
+                                    continue;
+                                };
+                                drop(device_guard);
+
+                                udp_tx
+                                    .send_to(packet, endpoint_addr)
+                                    .await
+                                    .map_err(Error::IoError)?;
+                            }
+                            Verdict::Consumed => {}
+                        }
+                        continue;
+                    }
+
                     let Ok(packet) = packet.try_into_ipvx() else {
                         continue;
                     };
@@ -818,15 +956,16 @@ impl<T: DeviceTransports> DeviceState<T> {
     async fn handle_outgoing(
         device: Weak<RwLock<Self>>,
         mut tun_rx: impl IpRecv,
+        mut tun_tx: impl IpSend,
         udp: impl UdpSend,
         mut packet_pool: PacketBufPool,
     ) -> Result<(), Error> {
-        let mut tun_mtu = {
+        let (router, mut tun_mtu) = {
             let Some(device) = device.upgrade() else {
                 return Ok(());
             };
             let device = device.read().await;
-            device.tun_rx_mtu.clone()
+            (device.router.clone(), device.tun_rx_mtu.clone())
         };
 
         loop {
@@ -839,6 +978,38 @@ impl<T: DeviceTransports> DeviceState<T> {
             };
 
             for packet in packets {
+                if let Some(router) = &router {
+                    let Some(device_arc) = device.upgrade() else {
+                        return Ok(());
+                    };
+
+                    match router.route_from_tun(packet) {
+                        Verdict::ToTun(packet) => {
+                            tun_tx.send(packet).await.map_err(Error::IoError)?;
+                        }
+                        Verdict::ToPeer(to, packet) => {
+                            let device_guard = device_arc.read().await;
+                            let Some(peer_arc) = device_guard.peers.get(&to) else {
+                                continue;
+                            };
+                            let Some((packet, peer_addr)) = device_guard
+                                .encapsulate(peer_arc, packet, &mut tun_mtu)
+                                .await
+                            else {
+                                continue;
+                            };
+
+                            drop(device_guard);
+
+                            if udp.send_to(packet, peer_addr).await.is_err() {
+                                break;
+                            }
+                        }
+                        Verdict::Consumed => {}
+                    }
+                    continue;
+                }
+
                 // Determine peer to use from the destination address
                 let Some(dst_addr) = packet.destination() else {
                     continue;
@@ -860,48 +1031,13 @@ impl<T: DeviceTransports> DeviceState<T> {
                     continue;
                 };
 
-                let mut peer = peer_arc.lock().await;
-                let Some(peer_addr) = peer.endpoint().addr else {
-                    // TODO: Implement the following error handling from section 3 of the
-                    // whitepaper: If [peer_addr] matches no peer, it is dropped, and the sender is
-                    // informed by a standard ICMP “no route to host” packet, as well as returning
-                    // -ENOKEY to user space.
-                    tracing::error!("No endpoint");
+                let Some((packet, peer_addr)) = device_guard
+                    .encapsulate(&peer_arc, packet, &mut tun_mtu)
+                    .await
+                else {
                     continue;
                 };
 
-                #[cfg(feature = "daita")]
-                let PeerState { tunnel, daita, .. } = &mut *peer;
-                #[cfg(not(feature = "daita"))]
-                let PeerState { tunnel, .. } = &mut *peer;
-
-                #[cfg(feature = "daita")]
-                let packet = match daita {
-                    Some(daita) => daita.on_normal_sent(packet),
-                    None => packet.into(),
-                };
-                #[cfg(not(feature = "daita"))]
-                let packet = packet.into();
-
-                let Some(packet) = tunnel.handle_outgoing_packet(packet, Some(&mut tun_mtu)) else {
-                    continue;
-                };
-
-                // Register sender_idx from outgoing handshake packets
-                Self::register_handshake_idx(&device_guard.peers_by_idx, &packet, &peer_arc);
-
-                #[cfg(feature = "daita")]
-                let packet = match daita {
-                    None => packet.into(),
-                    Some(daita) => match daita.on_tunnel_sent(packet) {
-                        Some(packet) => packet.into(),
-                        None => continue,
-                    },
-                };
-                #[cfg(not(feature = "daita"))]
-                let packet = packet.into();
-
-                drop(peer); // release lock
                 drop(device_guard);
 
                 if udp.send_to(packet, peer_addr).await.is_err() {

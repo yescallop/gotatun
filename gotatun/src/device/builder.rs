@@ -19,7 +19,7 @@ use crate::noise::index_table::IndexTable;
 #[cfg(feature = "tun")]
 use crate::tun::tun_async_device::TunDevice;
 use crate::{
-    device::{Device, DeviceState, allowed_ips::AllowedIps, peer::Peer, uapi::UapiServer},
+    device::{Device, DeviceState, Router, allowed_ips::AllowedIps, peer::Peer, uapi::UapiServer},
     task::Task,
     tun::{IpRecv, IpSend},
     udp::{UdpTransportFactory, socket::UdpSocketFactory},
@@ -42,6 +42,7 @@ pub struct DeviceBuilder<Udp, TunTx, TunRx> {
     private_key: Option<StaticSecret>,
     port: u16,
     uapi: Option<UapiServer>,
+    router: Option<Arc<dyn Router>>,
 
     // TODO: consider turning this into a typestate, and adding a special case for single peer
     peers: Vec<Peer>,
@@ -78,6 +79,7 @@ impl DeviceBuilder<Nul, Nul, Nul> {
             tun_rx: Nul,
             private_key: None,
             uapi: None,
+            router: None,
             port: 0,
             peers: Vec::new(),
             index_table: None,
@@ -105,6 +107,7 @@ impl<X, Y> DeviceBuilder<Nul, X, Y> {
             tun_rx: self.tun_rx,
             private_key: self.private_key,
             uapi: self.uapi,
+            router: self.router,
             port: self.port,
             peers: self.peers,
             index_table: self.index_table,
@@ -181,6 +184,7 @@ impl<X> DeviceBuilder<X, Nul, Nul> {
             tun_rx: ip_rx,
             private_key: self.private_key,
             uapi: self.uapi,
+            router: self.router,
             port: self.port,
             peers: self.peers,
             index_table: self.index_table,
@@ -203,6 +207,14 @@ impl<X, Y, Z> DeviceBuilder<X, Y, Z> {
     /// Calling this twice will overwrite the previous `uapi`.
     pub fn with_uapi(mut self, uapi: UapiServer) -> Self {
         self.uapi = Some(uapi);
+        self
+    }
+
+    /// Have `router` decide where packets go, instead of routing them by allowed IPs.
+    ///
+    /// See [`Router`].
+    pub fn with_router(mut self, router: Arc<dyn Router>) -> Self {
+        self.router = Some(router);
         self
     }
 
@@ -288,6 +300,7 @@ impl<Udp: UdpTransportFactory, TunTx: IpSend, TunRx: IpRecv> DeviceBuilder<Udp, 
             peers_by_idx: parking_lot::Mutex::new(Default::default()),
             peers_by_ip: AllowedIps::new(),
             rate_limiter: None,
+            router: self.router,
             port: self.port,
             connection: None,
             suspended: self.suspended,

@@ -20,9 +20,12 @@ use tokio::{
 };
 use zerocopy::IntoBytes;
 
+use crate::device::{Error, Router, Verdict};
 use crate::noise::TimerParams;
 use crate::noise::index_table::IndexTable;
 use crate::packet::{Ip, Packet};
+use crate::tun::MtuWatcher;
+use crate::x25519::{PublicKey, StaticSecret};
 
 pub mod mock;
 
@@ -674,4 +677,242 @@ async fn test_device_pair(eavesdrop: impl AsyncFnOnce(MockEavesdropper) + Send) 
         drive_connection,
         eavesdrop
     };
+}
+
+type FromPeer = dyn Fn(&PublicKey, Packet<Ip>) -> Verdict + Send + Sync;
+type FromTun = dyn Fn(Packet<Ip>) -> Verdict + Send + Sync;
+
+/// A router made of two closures, recording the public keys that it is given.
+struct StubRouter {
+    from_peer: Box<FromPeer>,
+    from_tun: Box<FromTun>,
+    senders: std::sync::Mutex<Vec<PublicKey>>,
+}
+
+impl StubRouter {
+    fn new(
+        from_peer: impl Fn(&PublicKey, Packet<Ip>) -> Verdict + Send + Sync + 'static,
+        from_tun: impl Fn(Packet<Ip>) -> Verdict + Send + Sync + 'static,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            from_peer: Box::new(from_peer),
+            from_tun: Box::new(from_tun),
+            senders: Default::default(),
+        })
+    }
+}
+
+impl Router for StubRouter {
+    fn route_from_peer(
+        &self,
+        from: &PublicKey,
+        packet: Packet<Ip>,
+        _mtu: &mut MtuWatcher,
+    ) -> Verdict {
+        self.senders.lock().unwrap().push(*from);
+        (self.from_peer)(from, packet)
+    }
+
+    fn route_from_tun(&self, packet: Packet<Ip>) -> Verdict {
+        (self.from_tun)(packet)
+    }
+}
+
+/// What the plain device (the sender) sends when the other one has a router.
+fn router_test_packet() -> Packet<Ip> {
+    mock::packet(b"through the router")
+}
+
+/// A router's verdict on a packet from a peer takes effect, and it is told who sent it.
+#[tokio::test]
+#[test_log::test]
+async fn router_delivers_packet_from_peer_to_tun() {
+    let router = StubRouter::new(|_, packet| Verdict::ToTun(packet), |_| Verdict::Consumed);
+    let (alice, mut bob, _eve) = mock::device_pair_with_routers(None, Some(router.clone())).await;
+
+    alice.app_tx.send(router_test_packet()).await;
+    let received = timeout(Duration::from_secs(5), bob.app_rx.recv())
+        .await
+        .expect("packet should arrive");
+
+    // The router gets the packet as decrypted, which may have padding at its end.
+    let expected = router_test_packet();
+    assert!(received.as_bytes().starts_with(expected.as_bytes()));
+
+    let alice_key = get_first_and_only_peer(&bob).await.public_key;
+    assert_eq!(*router.senders.lock().unwrap(), [alice_key]);
+}
+
+/// A packet can be routed back to its sender, whose lock must not be held at that point.
+#[tokio::test]
+#[test_log::test]
+async fn router_forwards_packet_back_to_its_sender() {
+    let router = StubRouter::new(
+        |from, packet| Verdict::ToPeer(*from, packet),
+        |_| Verdict::Consumed,
+    );
+    let (mut alice, _bob, _eve) = mock::device_pair_with_routers(None, Some(router)).await;
+
+    alice.app_tx.send(router_test_packet()).await;
+    let received = timeout(Duration::from_secs(5), alice.app_rx.recv())
+        .await
+        .expect("packet should come back");
+    assert_eq!(received.as_bytes(), router_test_packet().as_bytes());
+}
+
+/// A router can answer with a packet other than the one it was given.
+#[tokio::test]
+#[test_log::test]
+async fn router_replaces_packet() {
+    let router = StubRouter::new(
+        |_, _| Verdict::ToTun(mock::packet(b"a different packet")),
+        |_| Verdict::Consumed,
+    );
+    let (alice, mut bob, _eve) = mock::device_pair_with_routers(None, Some(router)).await;
+
+    alice.app_tx.send(router_test_packet()).await;
+    let received = timeout(Duration::from_secs(5), bob.app_rx.recv())
+        .await
+        .expect("packet should arrive");
+    assert!(
+        received
+            .as_bytes()
+            .starts_with(mock::packet(b"a different packet").as_bytes())
+    );
+}
+
+/// A consumed packet goes nowhere, and traffic after it still flows.
+#[tokio::test]
+#[test_log::test]
+async fn router_consumes_packet() {
+    let router = StubRouter::new(
+        |_, packet| {
+            // The packet may have padding at its end.
+            if packet.as_bytes().windows(7).any(|w| w == b"keep me") {
+                Verdict::Consumed
+            } else {
+                Verdict::ToTun(packet)
+            }
+        },
+        |_| Verdict::Consumed,
+    );
+    let (alice, mut bob, _eve) = mock::device_pair_with_routers(None, Some(router)).await;
+
+    alice.app_tx.send(mock::packet(b"keep me")).await;
+    alice.app_tx.send(router_test_packet()).await;
+    let received = timeout(Duration::from_secs(5), bob.app_rx.recv())
+        .await
+        .expect("packet should arrive");
+    assert!(
+        received
+            .as_bytes()
+            .starts_with(router_test_packet().as_bytes())
+    );
+}
+
+/// A packet from the TUN goes where the router says, ignoring allowed IPs.
+#[tokio::test]
+#[test_log::test]
+async fn router_routes_packet_from_tun() {
+    let bob_key = std::sync::Arc::new(std::sync::OnceLock::<PublicKey>::new());
+    let router = {
+        let bob_key = bob_key.clone();
+        StubRouter::new(
+            |_, packet| Verdict::ToTun(packet),
+            move |packet| {
+                if packet.as_bytes().ends_with(b"to the tun") {
+                    Verdict::ToTun(packet)
+                } else {
+                    Verdict::ToPeer(*bob_key.get().unwrap(), packet)
+                }
+            },
+        )
+    };
+    let (mut alice, mut bob, _eve) = mock::device_pair_with_routers(Some(router), None).await;
+    bob_key
+        .set(get_first_and_only_peer(&alice).await.public_key)
+        .unwrap();
+
+    alice.app_tx.send(mock::packet(b"to the tun")).await;
+    let received = timeout(Duration::from_secs(5), alice.app_rx.recv())
+        .await
+        .expect("packet should come back");
+    assert_eq!(received.as_bytes(), mock::packet(b"to the tun").as_bytes());
+
+    // A router's packets don't wait for a session.
+    timeout(
+        Duration::from_secs(5),
+        alice.device.force_handshake(bob_key.get().unwrap()),
+    )
+    .await
+    .expect("handshake should complete")
+    .unwrap();
+
+    alice.app_tx.send(router_test_packet()).await;
+    let received = timeout(Duration::from_secs(5), bob.app_rx.recv())
+        .await
+        .expect("packet should arrive");
+    assert_eq!(received.as_bytes(), router_test_packet().as_bytes());
+}
+
+/// With a router, a packet for a peer with no session starts a handshake, and is dropped rather
+/// than sent when the handshake completes.
+#[tokio::test]
+#[test_log::test]
+async fn router_drops_packets_with_no_session() {
+    let router = StubRouter::new(|_, packet| Verdict::ToTun(packet), |_| Verdict::Consumed);
+    let (alice, mut bob, _eve) = mock::device_pair_with_routers(Some(router), None).await;
+    let bob_key = get_first_and_only_peer(&alice).await.public_key;
+
+    alice
+        .device
+        .send_to_peer(&bob_key, mock::packet(b"no session"))
+        .await
+        .unwrap();
+
+    // The packet started the handshake, so this only waits for it.
+    timeout(
+        Duration::from_secs(5),
+        alice.device.force_handshake(&bob_key),
+    )
+    .await
+    .expect("handshake should complete")
+    .unwrap();
+
+    alice
+        .device
+        .send_to_peer(&bob_key, mock::packet(b"a session"))
+        .await
+        .unwrap();
+    let received = timeout(Duration::from_secs(5), bob.app_rx.recv())
+        .await
+        .expect("packet should arrive");
+    assert_eq!(received.as_bytes(), mock::packet(b"a session").as_bytes());
+}
+
+/// `send_to_peer` starts a handshake if needed, and fails for an unknown peer.
+#[tokio::test]
+#[test_log::test]
+async fn send_to_peer_reaches_the_peer() {
+    let (alice, mut bob, _eve) = mock::device_pair().await;
+    let bob_key = get_first_and_only_peer(&alice).await.public_key;
+
+    alice
+        .device
+        .send_to_peer(&bob_key, router_test_packet())
+        .await
+        .unwrap();
+    let received = timeout(Duration::from_secs(5), bob.app_rx.recv())
+        .await
+        .expect("packet should arrive");
+    assert_eq!(received.as_bytes(), router_test_packet().as_bytes());
+
+    let stranger = PublicKey::from(&StaticSecret::random());
+    assert!(matches!(
+        alice
+            .device
+            .send_to_peer(&stranger, router_test_packet())
+            .await,
+        Err(Error::PeerNotFound)
+    ));
 }

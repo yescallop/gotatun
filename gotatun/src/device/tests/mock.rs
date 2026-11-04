@@ -29,7 +29,7 @@ use x25519_dalek::{PublicKey, StaticSecret};
 use zerocopy::IntoBytes;
 
 use crate::{
-    device::{Device, DeviceBuilder, Peer},
+    device::{Device, DeviceBuilder, Peer, Router},
     noise::index_table::IndexTable,
     packet::{
         Ip, IpNextProtocol, Ipv4, Ipv4Header, Ipv6, Packet, PacketBufPool, Udp, WgData,
@@ -48,6 +48,14 @@ pub const BOB_INDEX_SEED: u64 = 2;
 pub const TUN_MTU: u16 = 1360;
 
 pub async fn device_pair() -> (MockDevice, MockDevice, MockEavesdropper) {
+    device_pair_with_routers(None, None).await
+}
+
+/// Like [`device_pair`], with a [`Router`] for either device.
+pub async fn device_pair_with_routers(
+    router_a: Option<Arc<dyn Router>>,
+    router_b: Option<Arc<dyn Router>>,
+) -> (MockDevice, MockDevice, MockEavesdropper) {
     let (mock_tun_a, mock_app_tx_a, mock_app_rx_a) = mock_tun();
     let (mock_tun_b, mock_app_tx_b, mock_app_rx_b) = mock_tun();
 
@@ -138,7 +146,7 @@ pub async fn device_pair() -> (MockDevice, MockDevice, MockEavesdropper) {
         .with_endpoint((endpoint_b, port).into())
         .with_allowed_ip(Ipv4Network::new(Ipv4Addr::UNSPECIFIED, 0).unwrap().into());
 
-    let device_a = DeviceBuilder::new()
+    let mut builder_a = DeviceBuilder::new()
         .with_private_key(privkey_a)
         .with_ip(mock_tun_a.clone())
         .with_udp(udp_alice)
@@ -146,21 +154,23 @@ pub async fn device_pair() -> (MockDevice, MockDevice, MockEavesdropper) {
         .with_peer(peer_b)
         .with_index_table(IndexTable::from_rng(StdRng::seed_from_u64(
             ALICE_INDEX_SEED,
-        )))
-        .build()
-        .await
-        .expect("create mock device");
+        )));
+    if let Some(router) = router_a {
+        builder_a = builder_a.with_router(router);
+    }
+    let device_a = builder_a.build().await.expect("create mock device");
 
-    let device_b = DeviceBuilder::new()
+    let mut builder_b = DeviceBuilder::new()
         .with_private_key(privkey_b)
         .with_ip(mock_tun_b.clone())
         .with_udp(udp_bob)
         .with_listen_port(port) // TODO: is this necessary?
         .with_peer(peer_a)
-        .with_index_table(IndexTable::from_rng(StdRng::seed_from_u64(BOB_INDEX_SEED)))
-        .build()
-        .await
-        .expect("create mock device");
+        .with_index_table(IndexTable::from_rng(StdRng::seed_from_u64(BOB_INDEX_SEED)));
+    if let Some(router) = router_b {
+        builder_b = builder_b.with_router(router);
+    }
+    let device_b = builder_b.build().await.expect("create mock device");
 
     let alice = MockDevice {
         device: device_a,

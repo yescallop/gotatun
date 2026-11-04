@@ -15,6 +15,7 @@ use ipnetwork::IpNetwork;
 use std::net::SocketAddr;
 
 use tokio::sync::watch;
+use x25519_dalek::PublicKey;
 
 use crate::device::AllowedIps;
 #[cfg(feature = "daita")]
@@ -43,6 +44,8 @@ pub struct PendingHandshake {
 }
 
 pub struct PeerState {
+    /// The peer's public key
+    pub(crate) public_key: PublicKey,
     /// The associated tunnel struct
     pub(crate) tunnel: Tunn,
     pub(crate) endpoint: Endpoint,
@@ -59,12 +62,14 @@ pub struct PeerState {
 
 impl PeerState {
     pub fn new(
+        public_key: PublicKey,
         tunnel: Tunn,
         endpoint: Option<SocketAddr>,
         allowed_ips: &[IpNetwork],
         #[cfg(feature = "daita")] daita_settings: Option<DaitaSettings>,
     ) -> PeerState {
         Self {
+            public_key,
             tunnel,
             endpoint: Endpoint { addr: endpoint },
             allowed_ips: allowed_ips.iter().map(|ip| (ip, ())).collect(),

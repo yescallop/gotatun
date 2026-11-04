@@ -219,6 +219,19 @@ impl<R: RngCore + Send> Tunn<R> {
         }
     }
 
+    /// Like [`Self::handle_outgoing_packet`], but drops the packet if there is no session, rather
+    /// than queueing it. A handshake is still initiated if none is in progress.
+    pub fn handle_outgoing_packet_unqueued(
+        &mut self,
+        packet: Packet,
+        tun_mtu: &mut MtuWatcher,
+    ) -> Option<WgKind> {
+        match self.encapsulate_with_session(pad_to_x16(packet, tun_mtu)) {
+            Ok(encapsulated_packet) => Some(encapsulated_packet.into()),
+            Err(_packet) => self.format_handshake_initiation(false).map(Into::into),
+        }
+    }
+
     /// Encapsulate a single packet into a [`WgData`].
     ///
     /// Returns `Err(original_packet)` if there is no active session, or if the active session's
@@ -390,7 +403,8 @@ impl<R: RngCore + Send> Tunn<R> {
         self.set_current_session(slot);
 
         self.timer_tick(TimerName::TimeLastPacketReceived);
-        self.rx_bytes += decapsulated_packet.as_bytes().len();
+        // Count the packet as it arrived, which is how the sender counts it in `tx_bytes`.
+        self.rx_bytes += WgData::OVERHEAD + decapsulated_packet.as_bytes().len();
 
         Ok(decapsulated_packet)
     }
@@ -905,6 +919,20 @@ mod tests {
         );
     }
 
+    /// Both ends of a session count every packet alike: the handshake, the keepalive after it, and
+    /// data in either direction.
+    #[test]
+    fn peers_agree_on_bytes_sent_and_received() {
+        let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
+        assert_packet_roundtrip(&mut my_tun, &mut their_tun);
+        assert_packet_roundtrip(&mut their_tun, &mut my_tun);
+
+        let (_, my_tx, my_rx, ..) = my_tun.stats();
+        let (_, their_tx, their_rx, ..) = their_tun.stats();
+        assert_eq!(my_tx, their_rx);
+        assert_eq!(their_tx, my_rx);
+    }
+
     /// Send one IP packet over the established session and assert it round-trips.
     fn assert_packet_roundtrip(from: &mut Tunn, to: &mut Tunn) {
         let sent = create_ipv4_udp_packet();
@@ -1008,6 +1036,42 @@ mod tests {
             time_since_after_jump,
             Some(PRESENT),
             "time_since_last_handshake should never decrease"
+        );
+    }
+
+    /// Without a completed handshake, there is no time to tell, however one has been started.
+    #[test]
+    fn no_time_since_a_handshake_that_never_completed() {
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        assert_eq!(my_tun.time_since_last_handshake(), None);
+
+        let _init = create_handshake_init(&mut my_tun);
+        assert_eq!(my_tun.time_since_last_handshake(), None);
+    }
+
+    /// The time of the last handshake outlives its sessions, as a peer that has gone away is when
+    /// it is most useful. Trying again doesn't change it either, though that resets the timers.
+    #[test]
+    #[cfg(feature = "mock_instant")]
+    fn last_handshake_outlives_its_sessions() {
+        // REJECT_AFTER_TIME * 3, when all keys are dropped.
+        const KEYS_DROPPED: Duration = Duration::from_secs(540);
+        const LATER: Duration = Duration::from_secs(10);
+
+        MockClock::set_time(Duration::ZERO);
+        let (mut my_tun, _their_tun) = create_two_tuns_and_handshake();
+
+        MockClock::advance(KEYS_DROPPED);
+        let _ = my_tun.update_timers();
+        assert!(my_tun.sessions.iter().all(Option::is_none));
+        assert_eq!(my_tun.time_since_last_handshake(), Some(KEYS_DROPPED));
+
+        let _init = create_handshake_init(&mut my_tun);
+        MockClock::advance(LATER);
+        let _ = my_tun.update_timers();
+        assert_eq!(
+            my_tun.time_since_last_handshake(),
+            Some(KEYS_DROPPED + LATER)
         );
     }
 
